@@ -84,6 +84,7 @@ func Read(ctx context.Context, dir, pattern string) (*Program, error) {
 				if d, ok := decl.(*ast.GenDecl); ok && d.Tok == token.TYPE {
 					for _, raw := range d.Specs {
 						spec := raw.(*ast.TypeSpec)
+						program.readInterfaceMethods(p, file, spec)
 						if pos := firstDirective(d.Doc, spec.Doc); pos.IsValid() {
 							if obj, ok := p.TypesInfo.Defs[spec.Name].(*types.TypeName); ok {
 								program.TypeIssues[obj] = Error(p, pos, "type directives are unsupported; attach laws to functions")
@@ -133,6 +134,32 @@ func Read(ctx context.Context, dir, pattern string) (*Program, error) {
 		return nil, fmt.Errorf("%s", diagnostics[0])
 	}
 	return program, nil
+}
+
+// Interface methods have no FuncDecl, but their doc comments can supply the
+// same explicit assumptions as ordinary abstract dependencies.
+func (program *Program) readInterfaceMethods(p *packages.Package, file *ast.File, spec *ast.TypeSpec) {
+	iface, ok := spec.Type.(*ast.InterfaceType)
+	if !ok {
+		return
+	}
+	for _, method := range iface.Methods.List {
+		if len(method.Names) != 1 {
+			continue // Embedded interfaces own their method declarations.
+		}
+		name := method.Names[0]
+		fn, ok := p.TypesInfo.Defs[name].(*types.Func)
+		if !ok {
+			continue
+		}
+		decl := &ast.FuncDecl{Doc: method.Doc, Name: name, Type: method.Type.(*ast.FuncType)}
+		entry := Function{Package: p, File: file, Decl: decl}
+		entry.readDirectives()
+		if entry.Err == nil && (entry.Selected || entry.Termination != "") {
+			entry.Err = Error(p, name.Pos(), "interface methods only support golean:assume laws")
+		}
+		program.Functions[fn] = entry
+	}
 }
 
 func directive(text string) (kind, value string, ok bool) {
@@ -306,22 +333,34 @@ func (f *Function) readDirectives() {
 	}
 }
 
-// ResolveCallee resolves a local or file-import-qualified function name.
+// ResolveCallee resolves Function, alias.Function, Interface.Method, or
+// alias.Interface.Method. Interface aliases resolve to the original method.
 func (f Function) ResolveCallee(name string) *types.Func {
-	qualifier, member, qualified := strings.Cut(name, ".")
-	if !qualified {
-		fn, _ := f.Package.Types.Scope().Lookup(name).(*types.Func)
+	parts := strings.Split(name, ".")
+	scope := f.Package.Types.Scope()
+	if len(parts) > 1 {
+		for _, spec := range f.File.Imports {
+			var imported *types.PkgName
+			if spec.Name == nil {
+				imported, _ = f.Package.TypesInfo.Implicits[spec].(*types.PkgName)
+			} else {
+				imported, _ = f.Package.TypesInfo.Defs[spec.Name].(*types.PkgName)
+			}
+			if imported != nil && imported.Name() == parts[0] {
+				scope = imported.Imported().Scope()
+				parts = parts[1:]
+				break
+			}
+		}
+	}
+	if len(parts) == 1 {
+		fn, _ := scope.Lookup(parts[0]).(*types.Func)
 		return fn
 	}
-	for _, spec := range f.File.Imports {
-		var imported *types.PkgName
-		if spec.Name == nil {
-			imported, _ = f.Package.TypesInfo.Implicits[spec].(*types.PkgName)
-		} else {
-			imported, _ = f.Package.TypesInfo.Defs[spec.Name].(*types.PkgName)
-		}
-		if imported != nil && imported.Name() == qualifier {
-			fn, _ := imported.Imported().Scope().Lookup(member).(*types.Func)
+	if len(parts) == 2 {
+		if typ, ok := scope.Lookup(parts[0]).(*types.TypeName); ok && types.IsInterface(typ.Type()) {
+			obj, _, _ := types.LookupFieldOrMethod(typ.Type(), false, f.Package.Types, parts[1])
+			fn, _ := obj.(*types.Func)
 			return fn
 		}
 	}

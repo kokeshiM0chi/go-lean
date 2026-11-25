@@ -29,13 +29,19 @@ const (
 	List
 	FoldControl
 	Box
+	Interface
+	Pointer
+	Tuple
 )
+
+const ExternalTypesPackage = "go-lean:types"
 
 type Type struct {
 	Kind   Kind
 	Record Symbol
 	// Element is the element or map value type. Key is the ordered key type.
 	Element, Key *Type
+	Elements     []Type
 }
 
 type Field struct {
@@ -53,6 +59,16 @@ type Struct struct {
 
 func (Struct) declaration() {}
 
+// OpaqueInterface preserves an interface value without modeling its methods or
+// dynamic type. Its Lean carrier is opaque; nil is represented separately.
+type OpaqueInterface struct{ Symbol Symbol }
+
+func (OpaqueInterface) declaration() {}
+
+type OpaqueTypes struct{}
+
+func (OpaqueTypes) declaration() {}
+
 type Binding struct {
 	Unused bool
 	Name   string
@@ -67,6 +83,8 @@ type Function struct {
 	Body        Expr
 	Contracts   []Symbol
 	Termination string
+	// Partial wraps the result in Option: none denotes a nil interface call.
+	Partial bool
 }
 
 func (Function) declaration() {}
@@ -81,6 +99,8 @@ type Contract struct {
 	Params         []Type
 	Result         Type
 	Assumptions    []Proposition
+	// Name is the Go name exposed to assumption propositions.
+	Name string
 }
 
 func (Contract) declaration() {}
@@ -113,6 +133,7 @@ type Local struct{ ID int }
 type Let struct {
 	ID          int
 	Value, Body Expr
+	Unused      bool
 }
 type If struct{ Cond, Then, Else Expr }
 
@@ -163,10 +184,25 @@ type StructLiteral struct {
 	Fields []Expr
 }
 type Call struct {
+	Target  Symbol
+	Args    []Expr
+	Partial bool
+}
+
+type TupleLiteral struct{ Values []Expr }
+type TupleRead struct {
+	Value        Expr
+	Index, Count int
+}
+type Deref struct{ Value Expr }
+type AbstractCall struct {
 	Target Symbol
 	Args   []Expr
 }
-type AbstractCall struct {
+
+// InterfaceCall dispatches through an explicit contract. Args includes the
+// interface receiver first; a nil receiver aborts the enclosing partial model.
+type InterfaceCall struct {
 	Target Symbol
 	Args   []Expr
 }
@@ -236,6 +272,10 @@ func (FieldRead) expression()          {}
 func (StructLiteral) expression()      {}
 func (Call) expression()               {}
 func (AbstractCall) expression()       {}
+func (InterfaceCall) expression()      {}
+func (TupleLiteral) expression()       {}
+func (TupleRead) expression()          {}
+func (Deref) expression()              {}
 func (Primitive) expression()          {}
 func (Fold) expression()               {}
 func (FoldControlLiteral) expression() {}

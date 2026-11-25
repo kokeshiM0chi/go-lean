@@ -23,9 +23,9 @@ Use the exact `//golean:` prefix in Go doc comments.
 | `//golean:verify name : proposition` | Declare a package-unique law. On a function or method, select that operation for modeling. |
 | `//golean:verify+ continuation` | Continue a law on consecutive lines. |
 | `//golean:verify:import Lean.Module` | Import one Lean module from a package doc comment. |
-| `//golean:assume name : proposition` | Declare a law about a scalar dependency function. Use its unqualified Go name in the law. |
+| `//golean:assume name : proposition` | Declare a law about a scalar dependency function or interface method. Use its unqualified Go name in the law. |
 | `//golean:assume+ continuation` | Continue a dependency law on consecutive lines. |
-| `//golean:abstract alias.Function` | Replace an explicitly named direct call from a verified root with a contract parameter. A local function can use an unqualified name. |
+| `//golean:abstract alias.Function` | Replace a function or interface method call from a verified root with a contract parameter. Accepts `Function`, `alias.Function`, `Interface.Method`, or `alias.Interface.Method`. |
 | `//golean:termination:by measure` | Supply a Lean `Nat` measure over a directly recursive function's entry parameters. |
 
 ## Lean files

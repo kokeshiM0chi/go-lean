@@ -80,6 +80,19 @@ func leanType(t ir.Type) string {
 	switch t.Kind {
 	case ir.Record:
 		return qualified(t.Record)
+	case ir.Interface:
+		return "(_root_.Option " + carrier(t.Record) + ")"
+	case ir.Pointer:
+		if t.Element == nil {
+			return "(_root_.Option " + carrier(t.Record) + ")"
+		}
+		return "(_root_.Option " + leanType(*t.Element) + ")"
+	case ir.Tuple:
+		parts := make([]string, len(t.Elements))
+		for i, elem := range t.Elements {
+			parts[i] = leanType(elem)
+		}
+		return "(" + strings.Join(parts, " × ") + ")"
 	case ir.Array:
 		return "(_root_.Array " + leanType(*t.Element) + ")"
 	case ir.ByteArray:
@@ -99,6 +112,13 @@ func leanType(t ir.Type) string {
 	default:
 		return scalar[t.Kind]
 	}
+}
+
+func carrier(sym ir.Symbol) string {
+	if sym.Package == ir.ExternalTypesPackage {
+		return "(" + qualified(ir.Symbol{Package: ir.ExternalTypesPackage, Name: "carrier"}) + " " + strconv.Quote(sym.Name) + ")"
+	}
+	return qualified(sym)
 }
 
 func (r renderer) model(p *ir.Package, modules map[string]string) string {
@@ -132,6 +152,10 @@ func (r renderer) model(p *ir.Package, modules map[string]string) string {
 	r.writeFolds(&b, p.Folds)
 	for _, decl := range p.Decls {
 		switch d := decl.(type) {
+		case ir.OpaqueTypes:
+			b.WriteString("\nopaque «carrier» (_ : _root_.String) : Type := _root_.Nat\n")
+		case ir.OpaqueInterface:
+			fmt.Fprintf(&b, "\nopaque %s : Type := _root_.Nat\n", identifier(d.Symbol.Name))
 		case ir.Struct:
 			writeStruct(&b, d)
 		case ir.Contract:
@@ -141,7 +165,7 @@ func (r renderer) model(p *ir.Package, modules map[string]string) string {
 			}
 			fmt.Fprintln(&b, leanType(d.Result))
 			for _, law := range d.Assumptions {
-				fmt.Fprintf(&b, "  %s : (let %s := operation;\n    %s)\n", identifier(law.Name), identifier(d.Callee.Name), indent(law.Lean, 4))
+				fmt.Fprintf(&b, "  %s : (let %s := operation;\n    %s)\n", identifier(law.Name), identifier(d.Name), indent(law.Lean, 4))
 			}
 		case ir.Function:
 			if d.Termination != "" {
@@ -161,7 +185,16 @@ func (r renderer) model(p *ir.Package, modules map[string]string) string {
 			body := r
 			body.measured = d.Termination != ""
 			body.self = d.Symbol
-			fmt.Fprintf(&b, " : %s :=\n  %s\n", leanType(d.Result), body.expr(d.Body))
+			result := leanType(d.Result)
+			var expression string
+			if d.Partial {
+				result = "(_root_.Option " + result + ")"
+				partial := partialRenderer{renderer: body}
+				expression = partial.expr(d.Body)
+			} else {
+				expression = body.expr(d.Body)
+			}
+			fmt.Fprintf(&b, " : %s :=\n  %s\n", result, expression)
 			if body.measured {
 				writeTermination(&b, d)
 			}
@@ -249,7 +282,11 @@ func (r renderer) expr(e ir.Expr) string {
 	case ir.Local:
 		return local(v.ID)
 	case ir.Let:
-		return "(let " + local(v.ID) + " := " + r.expr(v.Value) + "; " + r.expr(v.Body) + ")"
+		name := local(v.ID)
+		if v.Unused {
+			name = "_"
+		}
+		return "(let " + name + " := " + r.expr(v.Value) + "; " + r.expr(v.Body) + ")"
 	case ir.If:
 		if r.measured {
 			if neg, ok := v.Cond.(ir.Unary); ok && neg.Op == ir.Not {
@@ -277,6 +314,21 @@ func (r renderer) expr(e ir.Expr) string {
 		return "(" + r.expr(v.Record) + ")." + field(v.Name)
 	case ir.StructLiteral:
 		return r.apply(qualified(v.Type)+".mk", v.Fields)
+	case ir.TupleLiteral:
+		parts := make([]string, len(v.Values))
+		for i, value := range v.Values {
+			parts[i] = r.expr(value)
+		}
+		return "(" + strings.Join(parts, ", ") + ")"
+	case ir.TupleRead:
+		value := r.expr(v.Value)
+		for i := 0; i < v.Index; i++ {
+			value = "(" + value + ").2"
+		}
+		if v.Index < v.Count-1 {
+			value = "(" + value + ").1"
+		}
+		return value
 	case ir.Call:
 		if r.measured && v.Target == r.self {
 			return r.apply(identifier(v.Target.Name), v.Args)

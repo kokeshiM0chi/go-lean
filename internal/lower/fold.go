@@ -32,13 +32,16 @@ func (f *function) fold(e *ast.CallExpr, kind ir.FoldKind) (ir.Expr, error) {
 	if _, err := f.goType(p, e.Pos(), p.TypesInfo.TypeOf(e)); err != nil {
 		return nil, err
 	}
-	args, err := f.arguments(e.Args[:2])
+	args, err := f.arguments(e.Args[:2], p.TypesInfo.TypeOf(e.Fun).(*types.Signature))
 	if err != nil {
 		return nil, err
 	}
 	abstract, err := f.callTarget(fn, step.Pos())
 	if err != nil {
 		return nil, err
+	}
+	if f.compiler.partial[fn] {
+		return nil, load.Error(p, step.Pos(), "fold steps with partial pointer reads are unsupported; model failure explicitly in the fold state")
 	}
 	f.output(p.PkgPath).Folds |= kind
 	return ir.Fold{Kind: kind, Input: args[0], Initial: args[1], Step: symbol(fn), Abstract: abstract}, nil

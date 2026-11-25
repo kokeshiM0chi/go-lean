@@ -16,6 +16,25 @@ var binaryOps = map[token.Token]ir.BinaryOp{
 	token.LAND: ir.And, token.LOR: ir.Or,
 }
 
+// value checks contextual interface assignments before expression lowering.
+// Go permits implicit boxing and conversions between distinct interfaces; the
+// opaque model only preserves values of the very same named interface type.
+func (f *function) value(node ast.Expr, want types.Type) (ir.Expr, error) {
+	p := f.source.Package
+	_, pointer := types.Unalias(want).(*types.Pointer)
+	if types.IsInterface(want) || pointer {
+		actual := p.TypesInfo.TypeOf(node)
+		if actual == types.Typ[types.UntypedNil] {
+			t, err := f.goType(p, node.Pos(), want)
+			return ir.Primitive{Op: ir.None, Type: t}, err
+		}
+		if types.IsInterface(want) && !types.Identical(actual, want) {
+			return nil, load.Error(p, node.Pos(), "interface conversion from %s to %s is unsupported; opaque interfaces can only be passed through unchanged", actual, want)
+		}
+	}
+	return f.expr(node)
+}
+
 func (f *function) expr(node ast.Expr) (ir.Expr, error) {
 	p := f.source.Package
 	info := p.TypesInfo
@@ -47,13 +66,54 @@ func (f *function) expr(node ast.Expr) (ir.Expr, error) {
 		if !ok || !found {
 			return nil, load.Error(p, e.Pos(), "expected an immutable local or constant, got %s", e.Name)
 		}
+		f.used[id] = true
 		return ir.Local{ID: id}, nil
 	case *ast.UnaryExpr:
+		if e.Op == token.AND {
+			if _, ok := ast.Unparen(e.X).(*ast.StarExpr); ok {
+				return nil, load.Error(p, e.Pos(), "address-of-indirection expressions are unsupported")
+			}
+			t, err := f.goType(p, e.Pos(), info.TypeOf(e))
+			if err != nil {
+				return nil, err
+			}
+			if t.Element == nil {
+				return nil, load.Error(p, e.Pos(), "address-taking requires a modeled immutable payload")
+			}
+			value, err := f.expr(e.X)
+			return ir.Primitive{Op: ir.Some, Type: t, Args: []ir.Expr{value}}, err
+		}
 		if e.Op == token.NOT {
 			value, err := f.expr(e.X)
 			return ir.Unary{Op: ir.Not, Value: value}, err
 		}
+	case *ast.StarExpr:
+		value, err := f.expr(e.X)
+		if err != nil {
+			return nil, err
+		}
+		return f.deref(e.Pos(), info.TypeOf(e.X), value)
 	case *ast.BinaryExpr:
+		leftType, rightType := info.TypeOf(e.X), info.TypeOf(e.Y)
+		if e.Op == token.EQL || e.Op == token.NEQ {
+			value, typ := e.X, leftType
+			if leftType == types.Typ[types.UntypedNil] {
+				value, typ = e.Y, rightType
+			}
+			_, pointer := types.Unalias(typ).(*types.Pointer)
+			if (types.IsInterface(typ) || pointer) && (leftType == types.Typ[types.UntypedNil] || rightType == types.Typ[types.UntypedNil]) {
+				t, err := f.goType(p, value.Pos(), typ)
+				if err != nil {
+					return nil, err
+				}
+				operand, err := f.expr(value)
+				var result ir.Expr = ir.Primitive{Op: ir.IsSome, Type: t, Args: []ir.Expr{operand}}
+				if e.Op == token.EQL {
+					result = ir.Unary{Op: ir.Not, Value: result}
+				}
+				return result, err
+			}
+		}
 		t, err := f.goType(p, e.X.Pos(), info.TypeOf(e.X))
 		if err != nil {
 			return nil, err
@@ -70,12 +130,22 @@ func (f *function) expr(node ast.Expr) (ir.Expr, error) {
 		return ir.Binary{Op: op, Kind: t.Kind, Left: left, Right: right}, err
 	case *ast.SelectorExpr:
 		sel := info.Selections[e]
-		if sel != nil && sel.Kind() == types.FieldVal && !sel.Indirect() && len(sel.Index()) == 1 {
+		if sel != nil && sel.Kind() == types.FieldVal && len(sel.Index()) == 1 {
 			t, err := f.goType(p, e.X.Pos(), sel.Recv())
 			if err != nil {
 				return nil, err
 			}
 			receiver, err := f.expr(e.X)
+			if err != nil {
+				return nil, err
+			}
+			if t.Kind == ir.Pointer {
+				receiver, err = f.deref(e.Pos(), sel.Recv(), receiver)
+				if err != nil {
+					return nil, err
+				}
+				t = *t.Element
+			}
 			return ir.FieldRead{Record: receiver, Name: sel.Obj().Name(), Control: t.Kind == ir.FoldControl}, err
 		}
 	case *ast.CompositeLit:
@@ -141,7 +211,7 @@ func (f *function) literal(e *ast.CompositeLit) (ir.Expr, error) {
 			if record.Field(i).Name() != name {
 				continue
 			}
-			fields[i], err = f.expr(kv.Value)
+			fields[i], err = f.value(kv.Value, record.Field(i).Type())
 			if err != nil {
 				return nil, err
 			}
@@ -210,7 +280,6 @@ func (f *function) call(e *ast.CallExpr) (ir.Expr, error) {
 		var t ir.Type
 		var op ir.PrimitiveOp
 		var err error
-		nodes := e.Args
 		if selection == nil {
 			op = constructors[fn.Name()]
 			if op != 0 {
@@ -219,7 +288,6 @@ func (f *function) call(e *ast.CallExpr) (ir.Expr, error) {
 		} else if receiver != nil && !selection.Indirect() && len(selection.Index()) == 1 {
 			t, err = f.goType(p, receiver.Pos(), selection.Recv())
 			op = methods[t.Kind][fn.Name()]
-			nodes = append([]ast.Expr{receiver}, e.Args...)
 		}
 		if err != nil {
 			return nil, err
@@ -227,24 +295,54 @@ func (f *function) call(e *ast.CallExpr) (ir.Expr, error) {
 		if op == 0 {
 			return nil, load.Error(p, e.Pos(), "unsupported curated operation %s", fn.Name())
 		}
-		args, err := f.arguments(nodes)
+		args, err := f.callArguments(e, receiver)
 		if err == nil && op == ir.BoxGet {
 			args = append(args, f.zero(*t.Element))
 		}
 		return ir.Primitive{Op: op, Type: t, Args: args}, err
 	}
-	nodes := e.Args
 	if selection != nil {
-		if !valueReceiver(fn) || selection.Indirect() || len(selection.Index()) != 1 {
+		if types.IsInterface(selection.Recv()) {
+			if !types.Identical(selection.Recv(), fn.Signature().Recv().Type()) {
+				return nil, load.Error(p, e.Pos(), "interface method receiver conversions are unsupported; call through the declaring interface type")
+			}
+			if _, ok := f.contracts[fn]; !ok {
+				return nil, load.Error(p, e.Pos(), "interface method calls require an explicit golean:abstract contract with golean:assume laws")
+			}
+			args, err := f.callArguments(e, receiver)
+			if err != nil {
+				return nil, err
+			}
+			f.contracts[fn] = true
+			return ir.InterfaceCall{Target: symbol(fn), Args: args}, nil
+		}
+		if !valueReceiver(fn) || len(selection.Index()) != 1 {
 			return nil, load.Error(p, e.Pos(), "expected a direct call on a concrete value receiver")
 		}
-		if receiver != nil {
-			nodes = append([]ast.Expr{receiver}, nodes...)
-		}
 	}
-	args, err := f.arguments(nodes)
+	args, err := f.callArguments(e, receiver)
 	if err != nil {
 		return nil, err
+	}
+	if selection != nil {
+		want := fn.Signature().Recv().Type()
+		_, pointerMethod := types.Unalias(want).(*types.Pointer)
+		_, pointerValue := types.Unalias(selection.Recv()).(*types.Pointer)
+		if pointerMethod && !pointerValue {
+			t, err := f.goType(p, e.Pos(), want)
+			if err != nil {
+				return nil, err
+			}
+			if t.Element == nil {
+				return nil, load.Error(p, e.Pos(), "implicit address-taking requires a modeled immutable payload")
+			}
+			args[0] = ir.Primitive{Op: ir.Some, Type: t, Args: []ir.Expr{args[0]}}
+		} else if !pointerMethod && pointerValue {
+			args[0], err = f.deref(e.Pos(), selection.Recv(), args[0])
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	if fn == f.fn && f.source.Termination != "" {
 		f.recursive = true
@@ -257,7 +355,9 @@ func (f *function) call(e *ast.CallExpr) (ir.Expr, error) {
 	if abstract {
 		return ir.AbstractCall{Target: symbol(fn), Args: args}, nil
 	}
-	return ir.Call{Target: symbol(fn), Args: args}, nil
+	partial := f.compiler.partial[fn]
+	f.hasPartial = f.hasPartial || partial
+	return ir.Call{Target: symbol(fn), Args: args, Partial: partial}, nil
 }
 
 func (f *function) callTarget(fn *types.Func, pos token.Pos) (bool, error) {
@@ -286,14 +386,48 @@ func (f *function) callTarget(fn *types.Func, pos token.Pos) (bool, error) {
 	return false, nil
 }
 
-func (f *function) arguments(nodes []ast.Expr) ([]ir.Expr, error) {
+func (f *function) arguments(nodes []ast.Expr, sig *types.Signature) ([]ir.Expr, error) {
 	args := make([]ir.Expr, len(nodes))
 	for i, node := range nodes {
-		value, err := f.expr(node)
+		if _, tuple := f.source.Package.TypesInfo.TypeOf(node).(*types.Tuple); tuple {
+			return nil, load.Error(f.source.Package, node.Pos(), "destructure multiple results into locals before passing them as arguments")
+		}
+		value, err := f.value(node, sig.Params().At(i).Type())
 		if err != nil {
 			return nil, err
 		}
 		args[i] = value
+	}
+	return args, nil
+}
+
+func (f *function) deref(pos token.Pos, typ types.Type, value ir.Expr) (ir.Expr, error) {
+	t, err := f.goType(f.source.Package, pos, typ)
+	if err != nil {
+		return nil, err
+	}
+	if t.Kind != ir.Pointer || t.Element == nil {
+		return nil, load.Error(f.source.Package, pos, "pointer dereference requires a modeled immutable payload")
+	}
+	f.hasPartial = true
+	return ir.Deref{Value: value}, nil
+}
+
+func (f *function) callArguments(e *ast.CallExpr, receiver ast.Expr) ([]ir.Expr, error) {
+	sig := f.source.Package.TypesInfo.TypeOf(e.Fun).(*types.Signature)
+	if sig.Variadic() {
+		return nil, load.Error(f.source.Package, e.Pos(), "expected a non-variadic function call")
+	}
+	args, err := f.arguments(e.Args, sig)
+	if err != nil {
+		return nil, err
+	}
+	if receiver != nil {
+		value, err := f.expr(receiver)
+		if err != nil {
+			return nil, err
+		}
+		args = append([]ir.Expr{value}, args...)
 	}
 	return args, nil
 }

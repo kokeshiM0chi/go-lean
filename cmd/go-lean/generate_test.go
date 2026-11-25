@@ -220,10 +220,10 @@ func TestSubsetDiagnostics(t *testing.T) {
 		{"func F() bool { return helper() }; func helper() bool { for range 1 { return true }; return false }", "raw loops are unsupported"},
 		{"func F(x int64) int64 { return F(x) }", "recursive call"},
 		{"func F(x int64) int64 { y := x; y = 1; return y }", "only immutable"},
-		{"func F(x *[]int64) int64 { return 0 }", "unsupported type"},
+		{"func F(x []int64) int64 { return 0 }", "unsupported type"},
 		{"func F(x int64) int64 { return x * 2 }", "unsupported binary operator"},
 		{"func F() bool { return len([1]int{}) == 1 }", "unsupported constant builtin call"},
-		{"func F(v Value) bool { return v.Check() }; type Value struct{}; func (*Value) Check() bool { return true }", "concrete value receiver"},
+		{"func F(v Value) bool { return v.Check() }; type Value struct{ X bool }; func (v *Value) Check() bool { v.X = true; return v.X }", "only immutable"},
 		{"func F() bool { return Outer{}.Check() }; type Outer struct{ Value }; type Value bool; func (v Value) Check() bool { return v == true }", "concrete value receiver"},
 		{"func F(v interface{ Check() bool }) bool { return v.Check() }", "unsupported type"},
 	} {
@@ -527,7 +527,6 @@ func TestRejectInvalidBoxedRecursion(t *testing.T) {
 	}{
 		{"slice", "func F(x lean.Box[[]byte]) byte { return 0 }", "unsupported type []byte"},
 		{"map", "func F(x lean.Box[map[byte]byte]) byte { return 0 }", "unsupported type map"},
-		{"pointer", "func F(x lean.Box[*byte]) byte { return 0 }", "unsupported type *byte"},
 		{"unannotated", "func F(x lean.Box[byte]) byte { return F(x) }", "recursive call"},
 		{"mutual", "//golean:termination:by x.toNat\nfunc F(x byte) byte { return other(x) }\nfunc other(x byte) byte { return F(x) }", "recursive call"},
 	} {

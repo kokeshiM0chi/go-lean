@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/frederik-jatzkowski/go-lean/internal/emit"
+	"github.com/frederik-jatzkowski/go-lean/internal/ir"
 	"github.com/frederik-jatzkowski/go-lean/internal/load"
 	"github.com/frederik-jatzkowski/go-lean/internal/lower"
 )
@@ -47,7 +48,13 @@ func generate(ctx context.Context, pattern string) ([]string, error) {
 	}
 	var outputs []output
 	var targets []string
-	workspace.clearSelection(pattern, locations)
+	selectedLocations := make(map[string]location)
+	for path, loc := range locations {
+		if path != ir.ExternalTypesPackage {
+			selectedLocations[path] = loc
+		}
+	}
+	workspace.clearSelection(pattern, selectedLocations)
 	for _, p := range packages {
 		loc := locations[p.Path]
 		checkStem := p.Name

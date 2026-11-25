@@ -1,12 +1,12 @@
 # Writing modeled Go
 
-Choose a small operation whose inputs and outputs express a property you want to prove. Let ordinary Go gather input, perform I/O, and display results. Put the decision in a function that takes values and returns one unnamed result. A record can carry the next state and observations together.
+Choose a small operation whose inputs and outputs express a property you want to prove. Let ordinary Go gather input, perform I/O, and display results. Put the decision in a function that takes values and returns unnamed results. A record can carry the next state and observations together, and multiple results become Lean products.
 
 ## Keep the model at a value boundary
 
 The bowling API returns a game and an acceptance flag. Its modeled value method returns a `rollResult` record, and the public wrapper unpacks it. The compiler copies source bytes into a `lean.ByteArray` at its public entry point, then works with that value inside the modeled call graph. [Bowling](../examples/proven/bowling/README.md) and [compiler](../examples/proven/stack_machine_compiler/README.md)
 
-Use concrete value receivers, explicit immutable local initializers, keyed record literals, `if`, and early returns. Return a new value when a field changes. A translated value method takes its receiver first in Lean, so `game.roll(pins)` becomes an application of `«Game$roll»` to `game` and `pins`.
+Use concrete receivers, explicit immutable local initializers, keyed record literals, `if`, and early returns. Read-only pointer receivers are supported; updates through pointers remain outside the subset. Return a new value when a field changes. A translated method takes its receiver first in Lean, so `game.roll(pins)` becomes an application of `«Game$roll»` to `game` and `pins`. See [runtime boundary types](runtime-boundary-types.md) for nil failure and multiple results.
 
 ## Move traversal state into a record
 

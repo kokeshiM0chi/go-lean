@@ -60,6 +60,12 @@ func (c *compiler) goType(p *packages.Package, pos token.Pos, typ types.Type) (i
 		}
 	}
 	switch t := types.Unalias(typ).(type) {
+	case *types.Pointer:
+		if c.snapshotPointer(p, t) {
+			elem, err := c.goType(p, pos, t.Elem())
+			return ir.Type{Kind: ir.Pointer, Element: &elem}, err
+		}
+		return ir.Type{Kind: ir.Pointer, Record: c.opaqueType(p, t)}, nil
 	case *types.Basic:
 		return basic(p, pos, t)
 	case *types.Named:
@@ -92,6 +98,23 @@ func (c *compiler) goType(p *packages.Package, pos token.Pos, typ types.Type) (i
 		switch u := t.Underlying().(type) {
 		case *types.Basic:
 			return basic(p, pos, u)
+		case *types.Interface:
+			if obj.Pkg() == nil || c.source.Packages[obj.Pkg().Path()] == nil || c.source.Packages[obj.Pkg().Path()].Module == nil || p.Module == nil || c.source.Packages[obj.Pkg().Path()].Module.Path != p.Module.Path {
+				return ir.Type{Kind: ir.Interface, Record: c.opaqueType(p, t)}, nil
+			}
+			if obj.Parent() != obj.Pkg().Scope() {
+				break
+			}
+			id := symbol(obj)
+			if err := c.depend(p, id.Package, pos); err != nil {
+				return ir.Type{}, err
+			}
+			if c.state[obj] == 0 {
+				out := c.output(id.Package)
+				out.Decls = append(out.Decls, ir.OpaqueInterface{Symbol: id})
+				c.state[obj] = 2
+			}
+			return ir.Type{Kind: ir.Interface, Record: id}, nil
 		case *types.Struct:
 			if obj.Parent() != obj.Pkg().Scope() {
 				break
@@ -162,10 +185,78 @@ func (c *compiler) zero(t ir.Type) ir.Expr {
 		return ir.Constant{Type: t}
 	case ir.FoldControl:
 		return ir.FoldControlLiteral{State: c.zero(*t.Element), Stop: c.zero(ir.Type{Kind: ir.Bool})}
+	case ir.Interface, ir.Pointer:
+		return ir.Primitive{Op: ir.None, Type: t}
+	case ir.Tuple:
+		values := make([]ir.Expr, len(t.Elements))
+		for i, elem := range t.Elements {
+			values[i] = c.zero(elem)
+		}
+		return ir.TupleLiteral{Values: values}
 	default:
 		if t.Kind < ir.Record {
 			return ir.Constant{Type: t, Value: "0"}
 		}
 		return ir.Primitive{Op: ir.Empty, Type: t}
 	}
+}
+
+// All external carriers share a fixed support module. Its contents do not vary
+// with package selection, so focused generation cannot invalidate other models.
+func (c *compiler) opaqueType(p *packages.Package, typ types.Type) ir.Symbol {
+	if c.packages[ir.ExternalTypesPackage] == nil {
+		c.packages[ir.ExternalTypesPackage] = &ir.Package{
+			Path: ir.ExternalTypesPackage, Name: "golean_types", Dir: p.Module.Dir,
+			Word: c.output(p.PkgPath).Word, Decls: []ir.Declaration{ir.OpaqueTypes{}},
+		}
+	}
+	out := c.output(p.PkgPath)
+	found := false
+	for _, path := range out.Imports {
+		found = found || path == ir.ExternalTypesPackage
+	}
+	if !found {
+		out.Imports = append(out.Imports, ir.ExternalTypesPackage)
+	}
+	return ir.Symbol{Package: ir.ExternalTypesPackage, Name: types.TypeString(canonicalType(typ), nil)}
+}
+
+func canonicalType(t types.Type) types.Type {
+	switch t := types.Unalias(t).(type) {
+	case *types.Pointer:
+		return types.NewPointer(canonicalType(t.Elem()))
+	case *types.Slice:
+		return types.NewSlice(canonicalType(t.Elem()))
+	case *types.Array:
+		return types.NewArray(canonicalType(t.Elem()), t.Len())
+	case *types.Map:
+		return types.NewMap(canonicalType(t.Key()), canonicalType(t.Elem()))
+	case *types.Chan:
+		return types.NewChan(t.Dir(), canonicalType(t.Elem()))
+	case *types.Struct:
+		fields, tags := make([]*types.Var, t.NumFields()), make([]string, t.NumFields())
+		for i := range fields {
+			f := t.Field(i)
+			fields[i] = types.NewField(f.Pos(), f.Pkg(), f.Name(), canonicalType(f.Type()), f.Embedded())
+			tags[i] = t.Tag(i)
+		}
+		return types.NewStruct(fields, tags)
+	default:
+		return t
+	}
+}
+
+func (c *compiler) resultType(p *packages.Package, pos token.Pos, results *types.Tuple) (ir.Type, error) {
+	if results.Len() == 1 {
+		return c.goType(p, pos, results.At(0).Type())
+	}
+	result := ir.Type{Kind: ir.Tuple}
+	for i := 0; i < results.Len(); i++ {
+		t, err := c.goType(p, pos, results.At(i).Type())
+		if err != nil {
+			return ir.Type{}, err
+		}
+		result.Elements = append(result.Elements, t)
+	}
+	return result, nil
 }
